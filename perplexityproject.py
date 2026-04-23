@@ -262,4 +262,47 @@ def main():
 
     stock_chart = px.line(
         stock_df.reset_index(),
-        x=stock_d
+        x="index", # Use 'index' as the column name after reset_index()
+        y=["Close", "MA20", "MA50"],
+        title=f"{stock} Price and Moving Averages",
+        labels={"index": "Date", "value": "Price", "variable": "Metric"}
+    )
+    st.plotly_chart(stock_chart, use_container_width=True)
+
+    st.subheader("Key Statistics")
+    st.json(stock_summary)
+
+    st.header("Portfolio Analysis")
+    col7, col8 = st.columns(2)
+    col7.metric("Portfolio Total Return", f"{portfolio_metrics['Portfolio Total Return']:.2%}")
+    col8.metric("Benchmark Total Return", f"{portfolio_metrics['Benchmark Total Return']:.2%}")
+
+    col9, col10 = st.columns(2)
+    col9.metric("Portfolio Volatility", f"{portfolio_metrics['Portfolio Volatility']:.2%}")
+    col10.metric("Benchmark Volatility", f"{portfolio_metrics['Benchmark Volatility']:.2%}")
+
+    col11, col12 = st.columns(2)
+    col11.metric("Portfolio Sharpe Ratio", f"{portfolio_metrics['Portfolio Sharpe']:.2f}")
+    col12.metric("Benchmark Sharpe Ratio", f"{portfolio_metrics['Benchmark Sharpe']:.2f}")
+
+    portfolio_chart = px.line(
+        cumulative_df.reset_index(),
+        x="index",
+        y=cumulative_df.columns,
+        title=f"Portfolio vs. {benchmark} Cumulative Returns",
+        labels={"index": "Date", "value": "Cumulative Return", "variable": "Asset"}
+    )
+    st.plotly_chart(portfolio_chart, use_container_width=True)
+
+    st.header("Interpretation")
+    st.write(interpretation_text(stock, stock_summary, portfolio_metrics, benchmark))
+
+    # Optional: Save results to files
+    stock_df.to_csv(OUTPUT_DIR / "stock_timeseries.csv")
+    pd.DataFrame([stock_summary]).to_csv(OUTPUT_DIR / "stock_summary.csv", index=False)
+    cumulative_df.to_csv(OUTPUT_DIR / "portfolio_growth.csv")
+    pd.DataFrame([portfolio_metrics]).to_csv(OUTPUT_DIR / "portfolio_metrics.csv", index=False)
+
+# Entry point for Streamlit app
+if __name__ == "__main__":
+    main()
