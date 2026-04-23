@@ -1,22 +1,22 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import matplotlib.pyplot as plt
+import plotly.express as px
 from pathlib import Path
+
+st.set_page_config(page_title="Financial Analytics Dashboard", layout="wide")
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
-
-STOCK = "AAPL"
-PORTFOLIO = {
+TRADING_DAYS = 252
+DEFAULT_PORTFOLIO = {
     "MSFT": 0.25,
     "AAPL": 0.20,
     "NVDA": 0.20,
     "JPM": 0.20,
     "XOM": 0.15,
 }
-BENCHMARK = "SPY"
-TRADING_DAYS = 252
 
 
 def calculate_rsi(close_series: pd.Series, window: int = 14) -> pd.Series:
@@ -61,29 +61,65 @@ def trading_recommendation(trend: str, rsi: float, vol_class: str):
     return "Hold", "Signals are mixed, so waiting for stronger confirmation is more consistent with the rules."
 
 
-def download_close_data(symbols, period: str):
-    data = yf.download(symbols, period=period, interval="1d", auto_adjust=False, progress=False)
+@st.cache_data(show_spinner=False)
+def download_close_data(symbols, period: str) -> pd.DataFrame:
+    data = yf.download(
+        symbols,
+        period=period,
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        multi_level_index=False,
+        threads=False,
+    )
+
+    if data is None or data.empty:
+        return pd.DataFrame()
+
     if isinstance(data.columns, pd.MultiIndex):
-        close = data["Close"]
+        if "Close" in data.columns.get_level_values(0):
+            close = data["Close"]
+        else:
+            return pd.DataFrame()
     else:
-        close = data[["Close"]]
-    return close.dropna()
+        if isinstance(symbols, str):
+            if "Close" not in data.columns:
+                return pd.DataFrame()
+            close = data[["Close"]].copy()
+            close.columns = [symbols]
+        else:
+            close_cols = [col for col in data.columns if col in list(symbols)]
+            if close_cols:
+                close = data[close_cols].copy()
+            elif "Close" in data.columns and len(symbols) == 1:
+                close = data[["Close"]].copy()
+                close.columns = list(symbols)
+            else:
+                return pd.DataFrame()
+
+    close = close.dropna(how="all")
+    return close
 
 
-def analyze_stock():
-    stock_df = download_close_data(STOCK, "6mo")
-    if isinstance(stock_df, pd.DataFrame) and STOCK in stock_df.columns:
-        stock_df = stock_df[[STOCK]].rename(columns={STOCK: "Close"})
-    else:
-        stock_df.columns = ["Close"]
+def analyze_stock(stock: str):
+    stock_df = download_close_data(stock, "6mo")
+    if stock_df.empty or stock not in stock_df.columns:
+        raise ValueError(f"No usable Yahoo Finance close-price data was returned for {stock}.")
 
+    stock_df = stock_df[[stock]].rename(columns={stock: "Close"}).copy()
     stock_df["MA20"] = stock_df["Close"].rolling(20).mean()
     stock_df["MA50"] = stock_df["Close"].rolling(50).mean()
     stock_df["RSI14"] = calculate_rsi(stock_df["Close"], 14)
     stock_df["Return"] = stock_df["Close"].pct_change()
     stock_df["Vol20_Ann"] = stock_df["Return"].rolling(20).std() * np.sqrt(TRADING_DAYS)
 
-    latest = stock_df.dropna().iloc[-1]
+    valid = stock_df.dropna(subset=["MA20", "MA50", "RSI14", "Vol20_Ann"])
+    if valid.empty:
+        raise ValueError(
+            f"Not enough valid observations to compute indicators for {stock}. At least 50 trading days are needed for the 50-day moving average."
+        )
+
+    latest = valid.iloc[-1]
     price = float(latest["Close"])
     ma20 = float(latest["MA20"])
     ma50 = float(latest["MA50"])
@@ -95,54 +131,44 @@ def analyze_stock():
     vol_class = classify_volatility(vol)
     recommendation, explanation = trading_recommendation(trend, rsi, vol_class)
 
-    summary = pd.DataFrame([
-        {
-            "Stock": STOCK,
-            "Current Price": round(price, 2),
-            "20-Day MA": round(ma20, 2),
-            "50-Day MA": round(ma50, 2),
-            "Trend": trend,
-            "14-Day RSI": round(rsi, 2),
-            "RSI Signal": rsi_signal,
-            "20-Day Annualized Volatility": round(vol, 4),
-            "Volatility Class": vol_class,
-            "Recommendation": recommendation,
-            "Explanation": explanation,
-        }
-    ])
+    summary = {
+        "Current Price": round(price, 2),
+        "20-Day MA": round(ma20, 2),
+        "50-Day MA": round(ma50, 2),
+        "Trend": trend,
+        "14-Day RSI": round(rsi, 2),
+        "RSI Signal": rsi_signal,
+        "20-Day Annualized Volatility": round(vol, 4),
+        "Volatility Class": vol_class,
+        "Recommendation": recommendation,
+        "Explanation": explanation,
+    }
 
-    stock_df.to_csv(OUTPUT_DIR / "stock_timeseries.csv")
-    summary.to_csv(OUTPUT_DIR / "stock_summary.csv", index=False)
-
-    plt.style.use("seaborn-v0_8")
-    fig, ax = plt.subplots(figsize=(12, 6))
-    stock_df[["Close", "MA20", "MA50"]].plot(ax=ax)
-    ax.set_title(f"{STOCK} Price and Moving Averages")
-    ax.set_ylabel("Price ($)")
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "stock_moving_averages.png", dpi=200)
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(12, 4))
-    stock_df["RSI14"].plot(ax=ax, color="purple")
-    ax.axhline(70, color="red", linestyle="--")
-    ax.axhline(30, color="green", linestyle="--")
-    ax.set_title(f"{STOCK} 14-Day RSI")
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "stock_rsi.png", dpi=200)
-    plt.close(fig)
-
-    return summary.iloc[0].to_dict()
+    return stock_df, summary
 
 
-def analyze_portfolio():
-    symbols = list(PORTFOLIO.keys()) + [BENCHMARK]
+def analyze_portfolio(portfolio: dict, benchmark: str):
+    symbols = list(portfolio.keys()) + [benchmark]
     close = download_close_data(symbols, "1y")
-    returns = close.pct_change().dropna()
-    weights = pd.Series(PORTFOLIO)
 
+    if close.empty:
+        raise ValueError("No usable Yahoo Finance data was returned for the portfolio or benchmark.")
+
+    missing = [symbol for symbol in symbols if symbol not in close.columns]
+    if missing:
+        raise ValueError(f"Missing close-price data for: {', '.join(missing)}")
+
+    close = close[symbols].dropna()
+    if close.empty:
+        raise ValueError("After aligning dates across all holdings and the benchmark, no overlapping price history remained.")
+
+    returns = close.pct_change().dropna()
+    if returns.empty:
+        raise ValueError("Not enough data to calculate daily returns for the portfolio.")
+
+    weights = pd.Series(portfolio)
     portfolio_returns = returns[weights.index].mul(weights, axis=1).sum(axis=1)
-    benchmark_returns = returns[BENCHMARK]
+    benchmark_returns = returns[benchmark]
 
     portfolio_total_return = float((1 + portfolio_returns).prod() - 1)
     benchmark_total_return = float((1 + benchmark_returns).prod() - 1)
@@ -152,34 +178,9 @@ def analyze_portfolio():
     portfolio_sharpe = float((portfolio_returns.mean() * TRADING_DAYS) / portfolio_volatility)
     benchmark_sharpe = float((benchmark_returns.mean() * TRADING_DAYS) / benchmark_volatility)
 
-    summary = pd.DataFrame([
-        {"Metric": "Total Return", "Portfolio": portfolio_total_return, "Benchmark_SPY": benchmark_total_return},
-        {"Metric": "Annualized Volatility", "Portfolio": portfolio_volatility, "Benchmark_SPY": benchmark_volatility},
-        {"Metric": "Sharpe Ratio", "Portfolio": portfolio_sharpe, "Benchmark_SPY": benchmark_sharpe},
-        {"Metric": "Outperformance vs SPY", "Portfolio": outperformance, "Benchmark_SPY": 0.0},
-    ])
-
-    weights_df = pd.DataFrame({"Ticker": weights.index, "Weight": weights.values})
-    cumulative = pd.DataFrame({
-        "Portfolio": (1 + portfolio_returns).cumprod(),
-        "SPY": (1 + benchmark_returns).cumprod(),
-    })
-
-    summary.to_csv(OUTPUT_DIR / "portfolio_summary.csv", index=False)
-    weights_df.to_csv(OUTPUT_DIR / "portfolio_weights.csv", index=False)
-    cumulative.to_csv(OUTPUT_DIR / "portfolio_growth.csv")
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    cumulative.plot(ax=ax)
-    ax.set_title("Portfolio vs SPY Growth of $1")
-    ax.set_ylabel("Growth of $1")
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "portfolio_vs_spy.png", dpi=200)
-    plt.close(fig)
-
-    return {
+    metrics = {
         "Portfolio Total Return": portfolio_total_return,
-        "Benchmark Total Return": benchmark_total_return,
+        "Benchmark Return": benchmark_total_return,
         "Outperformance": outperformance,
         "Portfolio Volatility": portfolio_volatility,
         "Benchmark Volatility": benchmark_volatility,
@@ -187,22 +188,78 @@ def analyze_portfolio():
         "Benchmark Sharpe": benchmark_sharpe,
     }
 
+    cumulative = pd.DataFrame({
+        "Portfolio": (1 + portfolio_returns).cumprod(),
+        benchmark: (1 + benchmark_returns).cumprod(),
+    })
+
+    return close, cumulative, metrics
+
+
+def interpretation_text(stock: str, stock_summary: dict, portfolio_metrics: dict, benchmark: str) -> str:
+    outperformed = portfolio_metrics["Outperformance"] > 0
+    more_risky = portfolio_metrics["Portfolio Volatility"] > portfolio_metrics["Benchmark Volatility"]
+    more_efficient = portfolio_metrics["Portfolio Sharpe"] > portfolio_metrics["Benchmark Sharpe"]
+
+    return (
+        f"The stock analysis for {stock} suggests a {stock_summary['Recommendation']} stance. "
+        f"Trend is {stock_summary['Trend'].lower()}, RSI is {stock_summary['RSI Signal'].lower()}, "
+        f"and volatility is classified as {stock_summary['Volatility Class'].lower()}.\n\n"
+        f"The portfolio {'outperformed' if outperformed else 'underperformed'} {benchmark} over the last year. "
+        f"It was {'more' if more_risky else 'less'} risky than the benchmark based on annualized volatility, "
+        f"and it was {'more' if more_efficient else 'less'} efficient based on the Sharpe ratio."
+    )
+
 
 def main():
-    stock_results = analyze_stock()
-    portfolio_results = analyze_portfolio()
+    st.title("Financial Analytics Dashboard")
+    st.write("Analyze one stock and one 5-asset portfolio using Yahoo Finance data.")
 
-    print("\nINDIVIDUAL STOCK ANALYSIS")
-    for key, value in stock_results.items():
-        print(f"{key}: {value}")
+    with st.sidebar:
+        st.header("Inputs")
+        stock = st.text_input("Individual stock ticker", value="AAPL").upper().strip()
+        benchmark = st.text_input("Benchmark ticker", value="SPY").upper().strip()
+        tickers_default = ", ".join(DEFAULT_PORTFOLIO.keys())
+        weights_default = ", ".join(str(v) for v in DEFAULT_PORTFOLIO.values())
+        tickers_input = st.text_input("Portfolio tickers (5, comma-separated)", value=tickers_default)
+        weights_input = st.text_input("Portfolio weights (comma-separated, sum to 1.0)", value=weights_default)
+        run_analysis = st.button("Run analysis", type="primary")
 
-    print("\nPORTFOLIO PERFORMANCE")
-    for key, value in portfolio_results.items():
-        if isinstance(value, float):
-            print(f"{key}: {value:.4f}")
-        else:
-            print(f"{key}: {value}")
+    if not run_analysis:
+        st.info("Enter your tickers and weights, then click Run analysis.")
+        return
 
+    try:
+        portfolio_tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+        portfolio_weights = [float(w.strip()) for w in weights_input.split(",") if w.strip()]
 
-if __name__ == "__main__":
-    main()
+        if len(portfolio_tickers) != 5:
+            raise ValueError("Please enter exactly 5 portfolio tickers.")
+        if len(portfolio_weights) != 5:
+            raise ValueError("Please enter exactly 5 portfolio weights.")
+        if abs(sum(portfolio_weights) - 1.0) > 1e-6:
+            raise ValueError("Portfolio weights must sum to 1.00.")
+
+        portfolio = dict(zip(portfolio_tickers, portfolio_weights))
+
+        stock_df, stock_summary = analyze_stock(stock)
+        close_df, cumulative_df, portfolio_metrics = analyze_portfolio(portfolio, benchmark)
+
+    except Exception as exc:
+        st.error(f"Analysis failed: {exc}", icon="🚨")
+        return
+
+    st.header("Individual Stock Analysis")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Current Price", f"${stock_summary['Current Price']:.2f}")
+    col2.metric("20-Day MA", f"${stock_summary['20-Day MA']:.2f}")
+    col3.metric("50-Day MA", f"${stock_summary['50-Day MA']:.2f}")
+
+    col4, col5, col6 = st.columns(3)
+    col4.metric("14-Day RSI", f"{stock_summary['14-Day RSI']:.2f}")
+    col5.metric("Trend", stock_summary["Trend"])
+    col6.metric("Recommendation", stock_summary["Recommendation"])
+
+    stock_chart = px.line(
+        stock_df.reset_index(),
+        x=stock_d
